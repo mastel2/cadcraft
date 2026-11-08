@@ -365,6 +365,14 @@ pub fn install_fonts(ctx: &egui::Context, language: &str) {
         {
             added.push(("system-arabic".into(), std::sync::Arc::new(egui::FontData::from_owned(bytes))));
         }
+        // ไทย: an installed Thai face after the Latin ones in every language, so Thai command
+        // input, layer and file names draw instead of boxes (egui's bundled faces have no Thai),
+        // unless craft-fonts' Thai face is embedded below.
+        if !embedded_script("Thai")
+            && let Some(bytes) = thai_font().and_then(|p| read_capped(p, MAX_UI_FONT_BYTES))
+        {
+            added.push(("system-thai".into(), std::sync::Arc::new(egui::FontData::from_owned(bytes))));
+        }
     }
     let embedded: Vec<_> = cadcraft_fonts::CRAFT_FONTS.iter().collect();
     added.extend(
@@ -484,7 +492,8 @@ pub fn shows_vietnamese(language: &str) -> bool {
 /// Chinese interface takes the face with its own glyphs ahead of a Japanese one — a Japanese face
 /// shares most ideographs but lacks the simplified-only ones (图 园 测), which would be tofu.
 /// The Georgian face follows in every language (egui's bundled faces carry no Georgian glyphs, and
-/// the picker names the language ქართული); العربية adds its Arabic face after those.
+/// the picker names the language ქართული), then the Thai face (Thai names can appear in any
+/// interface); العربية adds its Arabic face after those.
 fn embedded_ui_faces<'a>(faces: &[&'a cadcraft_fonts::CraftFont], language: &str) -> Vec<&'a cadcraft_fonts::CraftFont> {
     let cjk = |f: &&cadcraft_fonts::CraftFont| f.style == "Regular" && f.scripts.iter().any(|s| matches!(*s, "Jpan" | "Hans" | "Hant"));
     let mut out: Vec<_> = faces.iter().copied().filter(cjk).collect();
@@ -493,6 +502,8 @@ fn embedded_ui_faces<'a>(faces: &[&'a cadcraft_fonts::CraftFont], language: &str
         out.sort_by_key(|f| !f.scripts.contains(&"Hans"));
     }
     out.extend(faces.iter().copied().filter(|f| f.style == "Regular" && f.scripts.contains(&"Geor")));
+    // Thai names and typed text can appear in any interface, and no other face has Thai.
+    out.extend(faces.iter().copied().filter(|f| f.style == "Regular" && f.scripts.contains(&"Thai")));
     if language == "ar" {
         out.extend(faces.iter().copied().filter(|f| f.style == "Regular" && f.scripts.contains(&"Arab")));
     }
@@ -539,6 +550,35 @@ pub fn cjk_font() -> Option<&'static std::path::Path> {
                         "/usr/share/fonts/wqy-microhei/wqy-microhei.ttc",
                         "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
                         "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+                    ]
+                };
+                candidates.iter().map(std::path::PathBuf::from).find(|p| p.is_file())
+            })
+            .as_deref()
+    }
+    #[cfg(target_arch = "wasm32")]
+    None
+}
+
+/// An installed font with Thai glyphs, loaded in every language when craft-fonts' Thai face is
+/// not embedded; fonts are never bundled (only looked for where the OS or common packages put
+/// them). Checked once.
+pub fn thai_font() -> Option<&'static std::path::Path> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static FOUND: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+        FOUND
+            .get_or_init(|| {
+                let candidates: &[&str] = if cfg!(target_os = "macos") {
+                    &["/System/Library/Fonts/Supplemental/Thonburi.ttc", "/System/Library/Fonts/Thonburi.ttc"]
+                } else if cfg!(windows) {
+                    &["C:\\Windows\\Fonts\\LeelawUI.ttf", "C:\\Windows\\Fonts\\leelawad.ttf", "C:\\Windows\\Fonts\\tahoma.ttf"]
+                } else {
+                    &[
+                        "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+                        "/usr/share/fonts/noto/NotoSansThai-Regular.ttf",
+                        "/usr/share/fonts/google-noto/NotoSansThai-Regular.ttf",
+                        "/usr/share/fonts/truetype/tlwg/Loma.ttf",
                     ]
                 };
                 candidates.iter().map(std::path::PathBuf::from).find(|p| p.is_file())
@@ -898,6 +938,46 @@ mod tests {
                     for c in &letters {
                         assert!(view.has_glyph(&egui::FontId::new(12.0, family.clone()), *c), "{language}: missing Georgian glyph {c} in {family:?}");
                     }
+                }
+            });
+        }
+    }
+
+    /// The embedded Thai face loads in every interface, after the Georgian one (#2949).
+    #[test]
+    fn embedded_thai_face_loads_in_every_interface() {
+        let japanese = face("BIZ UDPGothic", &["Jpan", "Latn"]);
+        let georgian = face("Noto Sans Georgian", &["Geor"]);
+        let thai = face("Noto Sans Thai", &["Thai"]);
+        let arabic = face("Noto Sans Arabic", &["Arab"]);
+        let faces = [&japanese, &georgian, &thai, &arabic];
+        for language in ["en", "zh", "ko", "ka"] {
+            assert_eq!(
+                families(&super::embedded_ui_faces(&faces, language)),
+                ["BIZ UDPGothic", "Noto Sans Georgian", "Noto Sans Thai"],
+                "{language}"
+            );
+        }
+        assert_eq!(families(&super::embedded_ui_faces(&faces, "ar")), ["BIZ UDPGothic", "Noto Sans Georgian", "Noto Sans Thai", "Noto Sans Arabic"]);
+    }
+
+    /// Thai command input, layer and file names draw in both families in every interface, from
+    /// the embedded craft-fonts face or an installed Thai font (#2949). Skipped with neither.
+    #[test]
+    fn thai_text_draws_in_every_interface() {
+        if !super::embedded_script("Thai") && super::thai_font().is_none() {
+            eprintln!("skipped: no embedded craft-fonts Thai face and no installed Thai font");
+            return;
+        }
+        for language in ["en", "zh", "ko", "ar", "vi"] {
+            let ctx = egui::Context::default();
+            super::install_fonts(&ctx, language);
+            let mut output = ctx.run_ui(Default::default(), |_| {});
+            output.textures_delta.clear();
+            ctx.fonts_mut(|view| {
+                for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                    let font = egui::FontId::new(12.0, family.clone());
+                    assert!(view.has_glyphs(&font, "สวัสดีเลเยอร์"), "{language}: no Thai in {family:?}");
                 }
             });
         }
